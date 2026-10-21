@@ -1,118 +1,24 @@
 import express from "express";
-import helmet from "helmet";
 import cors from "cors";
-import compression from "compression";
-import rateLimit from "express-rate-limit";
-import swaggerUi from "swagger-ui-express";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
+import helmet from "helmet";
 import routes from "./routes/index.js";
-import { env } from "./config/environment.js";
-import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
-import requestIdMiddleware from "./middleware/requestId.js";
 
+import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 const app = express();
 
-// Trust the proxy in front of the application.
-// Verify that one trusted proxy hop matches your Vercel deployment.
-app.set("trust proxy", 1);
-
-// Generate a request ID before logging, rate limiting, or routing.
-app.use(requestIdMiddleware);
-
-// Security headers
+app.use(cors());
 app.use(helmet());
 
-// CORS configuration
-app.use(
-  cors({
-    origin(origin, callback) {
-      const allowedOrigins = env.CORS_ORIGINS.split(",")
-        .map((origin) => origin.trim())
-        .filter(Boolean);
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      return callback(new Error("Origin not allowed by CORS"));
-    },
-    credentials: true,
-  }),
-);
-
-// Request compression
-app.use(compression());
-
-// Request body parsing
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: false, limit: "1mb" }));
-
-// Rate limiting
-
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 100,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-
-  // Keep the default security validations enabled.
-  handler(req, res) {
-    console.warn("Rate limit exceeded", {
-      requestId: req.requestId,
-      ip: req.ip,
-      method: req.method,
-      path: req.originalUrl,
-    });
-
-    res.status(429).json({
-      success: false,
-      message: "Too many requests, please try again later.",
-      requestId: req.requestId,
-    });
-  },
-});
-
-app.use(limiter);
-
-// Root endpoint
-app.get("/", (_req, res) => {
+// Health Check
+app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "Oil Mill Management API",
-    docs: "/api-docs",
-    health: "/api/v1/health",
+    message: "Golden Drops Backend is running!",
   });
 });
-app.get("/api/v1/debug/proxy", (req, res) => {
-  res.json({
-    trustProxy: app.get("trust proxy"),
-    ip: req.ip,
-    ips: req.ips,
-    remoteAddress: req.socket.remoteAddress,
-    xForwardedFor: req.get("x-forwarded-for"),
-    xRealIp: req.get("x-real-ip"),
-  });
-});
-// Swagger / OpenAPI configuration
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const openapiPath = path.resolve(__dirname, "../docs/openapi.yaml");
-
-if (fs.existsSync(openapiPath)) {
-  app.get("/openapi.yaml", (_req, res) => {
-    res.type("text/yaml").send(fs.readFileSync(openapiPath, "utf8"));
-  });
-
-  app.use(
-    "/api-docs",
-    swaggerUi.serve,
-    swaggerUi.setup(undefined, {
-      swaggerUrl: "/openapi.yaml",
-    }),
-  );
-}
 
 // API routes
 app.use("/api/v1", routes);
