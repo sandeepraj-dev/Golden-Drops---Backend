@@ -1,12 +1,15 @@
 import mongoose from "mongoose";
 import { env } from "./environment.js";
 
-// Reuse one connection/promise per warm Node.js process (important on Vercel).
 let connectionPromise;
 
 export async function connectDatabase(
   uri = process.env.MONGODB_URI || env.MONGODB_URI,
 ) {
+  if (!uri) {
+    throw new Error("MONGODB_URI is not configured");
+  }
+
   mongoose.set("strictQuery", true);
 
   if (mongoose.connection.readyState === 1) {
@@ -16,15 +19,20 @@ export async function connectDatabase(
   if (!connectionPromise) {
     connectionPromise = mongoose
       .connect(uri, {
-        serverSelectionTimeoutMS: 10000,
+        serverSelectionTimeoutMS: 15000,
+        connectTimeoutMS: 15000,
         maxPoolSize: 10,
         minPoolSize: 0,
-        // A serverless function should not wait indefinitely for a database.
-        connectTimeoutMS: 10000,
       })
-      .then(() => mongoose.connection)
+      .then(() => {
+        console.log("MongoDB connected successfully");
+        return mongoose.connection;
+      })
       .catch((error) => {
         connectionPromise = undefined;
+
+        console.error("MongoDB connection failed:", error.message);
+
         throw error;
       });
   }
@@ -33,9 +41,13 @@ export async function connectDatabase(
 }
 
 export async function withTransaction(work) {
+  await connectDatabase();
+
   const session = await mongoose.startSession();
+
   try {
     let result;
+
     await session.withTransaction(
       async () => {
         result = await work(session);
@@ -46,6 +58,7 @@ export async function withTransaction(work) {
         readPreference: "primary",
       },
     );
+
     return result;
   } finally {
     await session.endSession();

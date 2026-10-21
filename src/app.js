@@ -51,12 +51,14 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 // Rate limiting
+
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   limit: 100,
   standardHeaders: "draft-8",
   legacyHeaders: false,
 
+  // Keep the default security validations enabled.
   handler(req, res) {
     console.warn("Rate limit exceeded", {
       requestId: req.requestId,
