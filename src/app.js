@@ -15,7 +15,7 @@ const app = express();
 
 // FIX: Configure proxy trust for Vercel.
 // Do this before express-rate-limit.
-app.set("trust proxy", true);
+app.set("trust proxy", 1);
 
 app.disable("x-powered-by");
 
