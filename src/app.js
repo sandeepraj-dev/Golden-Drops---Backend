@@ -7,72 +7,118 @@ import swaggerUi from "swagger-ui-express";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
 import routes from "./routes/index.js";
 import { env } from "./config/environment.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import requestIdMiddleware from "./middleware/requestId.js";
 
 const app = express();
-// Trust the single reverse proxy in front of the app (for example, Vercel).
-// This lets express-rate-limit derive the client IP from X-Forwarded-For safely.
-// Avoid `true` here: trusting every proxy hop can allow IP spoofing.
-// Vercel terminates the public request at its proxy before forwarding it here.
-// Trust one proxy hop; do not use `true`, which can allow spoofed forwarded IPs.
+
+// Trust the proxy in front of the application.
+// Verify that one trusted proxy hop matches your Vercel deployment.
 app.set("trust proxy", 1);
-app.disable("x-powered-by");
+
+// Generate a request ID before logging, rate limiting, or routing.
+app.use(requestIdMiddleware);
+
+// Security headers
 app.use(helmet());
+
+// CORS configuration
 app.use(
   cors({
     origin(origin, callback) {
-      if (
-        !origin ||
-        env.CORS_ORIGINS.split(",")
-          .map((s) => s.trim())
-          .includes(origin)
-      )
+      const allowedOrigins = env.CORS_ORIGINS.split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean);
+
+      if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
+      }
+
       return callback(new Error("Origin not allowed by CORS"));
     },
     credentials: true,
   }),
 );
+
+// Request compression
 app.use(compression());
+
+// Request body parsing
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false, limit: "1mb" }));
-app.use(
-  rateLimit({
-    windowMs: env.RATE_LIMIT_WINDOW_MS,
-    limit: env.RATE_LIMIT_MAX,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-  }),
-);
-app.get("/", (_req, res) =>
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 100,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+
+  handler(req, res) {
+    console.warn("Rate limit exceeded", {
+      requestId: req.requestId,
+      ip: req.ip,
+      method: req.method,
+      path: req.originalUrl,
+    });
+
+    res.status(429).json({
+      success: false,
+      message: "Too many requests, please try again later.",
+      requestId: req.requestId,
+    });
+  },
+});
+
+app.use(limiter);
+
+// Root endpoint
+app.get("/", (_req, res) => {
   res.json({
     success: true,
     message: "Oil Mill Management API",
     docs: "/api-docs",
     health: "/api/v1/health",
-  }),
-);
-
+  });
+});
+app.get("/api/v1/debug/proxy", (req, res) => {
+  res.json({
+    trustProxy: app.get("trust proxy"),
+    ip: req.ip,
+    ips: req.ips,
+    remoteAddress: req.socket.remoteAddress,
+    xForwardedFor: req.get("x-forwarded-for"),
+    xRealIp: req.get("x-real-ip"),
+  });
+});
+// Swagger / OpenAPI configuration
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const openapiPath = path.resolve(__dirname, "../docs/openapi.yaml");
+
 if (fs.existsSync(openapiPath)) {
-  // Swagger UI accepts a URL; serving YAML directly keeps this simple and deployment-safe.
-  app.get("/openapi.yaml", (_req, res) =>
-    res.type("text/yaml").send(fs.readFileSync(openapiPath, "utf8")),
-  );
+  app.get("/openapi.yaml", (_req, res) => {
+    res.type("text/yaml").send(fs.readFileSync(openapiPath, "utf8"));
+  });
+
   app.use(
     "/api-docs",
     swaggerUi.serve,
-    swaggerUi.setup(undefined, { swaggerUrl: "/openapi.yaml" }),
+    swaggerUi.setup(undefined, {
+      swaggerUrl: "/openapi.yaml",
+    }),
   );
 }
 
-// Generate request ID for every request
-app.use(requestIdMiddleware);
-
+// API routes
 app.use("/api/v1", routes);
+
+// 404 handler
 app.use(notFoundHandler);
+
+// Central error handler (must be last)
+app.use(errorHandler);
+
 export default app;
