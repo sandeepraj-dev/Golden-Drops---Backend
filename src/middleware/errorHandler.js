@@ -8,6 +8,7 @@ export function notFoundHandler(req, res) {
     error: {
       code: "ROUTE_NOT_FOUND",
       message: `Route ${req.method} ${req.originalUrl} not found`,
+      requestId: req.id ?? null,
     },
   });
 }
@@ -44,22 +45,42 @@ export function errorHandler(err, req, res, _next) {
     status = 400;
     code = "INVALID_ID";
     message = "Invalid identifier or value";
+  } else if (
+    err instanceof mongoose.Error ||
+    /buffering timed out/i.test(err.message || "")
+  ) {
+    status = 503;
+    code = "DATABASE_UNAVAILABLE";
+    message = "Database operation could not be completed";
   }
 
-  if (status >= 500) {
-    console.error("API_ERROR", {
-      requestId: req.id ?? "unknown",
-      method: req.method,
-      path: req.originalUrl,
-      errorName: err.name,
-      errorMessage: err.message,
-      stack: err.stack,
-    });
+  const isServerError = status >= 500;
 
+  if (isServerError) {
+    console.error(
+      JSON.stringify({
+        event: "API_ERROR",
+        requestId: req.id ?? null,
+        method: req.method,
+        path: req.originalUrl,
+        status,
+        code,
+        errorName: err.name,
+        errorMessage: err.message,
+        errorCode: err.code ?? null,
+        mongooseReadyState: mongoose.connection.readyState,
+        stack: err.stack,
+        timestamp: new Date().toISOString(),
+      }),
+    );
+
+    // Do not return database details or stack traces to clients.
     message =
-      process.env.NODE_ENV === "production"
-        ? "An internal error occurred"
-        : message;
+      status === 503
+        ? "Database temporarily unavailable"
+        : "An internal error occurred";
+
+    details = undefined;
   }
 
   res.status(status).json({
@@ -67,6 +88,7 @@ export function errorHandler(err, req, res, _next) {
     error: {
       code,
       message,
+      requestId: req.id ?? null,
       ...(details ? { details } : {}),
     },
   });
