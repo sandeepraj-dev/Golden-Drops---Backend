@@ -3,7 +3,9 @@ import { env } from "./environment.js";
 
 let connectionPromise;
 
-export async function connectDatabase(uri = env.MONGODB_URI) {
+export async function connectDatabase(
+  uri = "mongodb://sandyapks2001_db_user:UHrGlaOjHNoaUKPc@ac-eaqnwvz-shard-00-00.8krdkgg.mongodb.net:27017,ac-eaqnwvz-shard-00-01.8krdkgg.mongodb.net:27017,ac-eaqnwvz-shard-00-02.8krdkgg.mongodb.net:27017/?ssl=true&replicaSet=atlas-1r0r4d-shard-0&authSource=admin",
+) {
   mongoose.set("strictQuery", true);
 
   if (!uri) {
