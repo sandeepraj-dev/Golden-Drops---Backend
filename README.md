@@ -142,3 +142,12 @@ In **Vercel → Project → Settings → Environment Variables**, configure at l
 For MongoDB Atlas, open **Database & Network Access → IP Access List** and ensure the deployment can reach the cluster. For a quick connectivity diagnosis only, you can temporarily allow `0.0.0.0/0`, but this exposes the database network endpoint to all IPs; use strong database credentials and remove this rule after testing, or use a suitable stable-egress/private-network setup. See MongoDB Atlas network access documentation.
 
 After changing environment variables, redeploy the project. Test `/api/v1/health`, then `/api/v1/auth/login`. If you see `DATABASE_UNAVAILABLE`, inspect the new Vercel function log entry `Vercel request could not connect to MongoDB`; it should show the actual connection error instead of a Mongoose buffering timeout.
+
+
+## Vercel deployment verification (important)
+
+The repository root selected in Vercel must contain `package.json`, `vercel.json`, `api/index.js`, and `src/app.js` directly. Do not leave the project nested one extra level inside an `oil-mill-management-backend/` directory unless Vercel's **Root Directory** is set to that inner directory.
+
+After deploying, open **Deployments → latest production deployment → Source** and verify the deployed commit includes the `app.set("trust proxy", 1)` line in both `src/app.js` and `api/index.js`. The function logs should print `Vercel API bootstrap` with `trustProxy: 1` and `mongoReadyState: 1` before a request reaches the rate limiter. If those log fields never appear and the old error persists, Vercel is serving a different/older project root or commit.
+
+Set `MONGODB_URI` in Vercel's Production environment and redeploy after changing it. If MongoDB cannot connect, this serverless entry point returns `503 DATABASE_UNAVAILABLE` and logs `Vercel request could not connect to MongoDB` with the connection error. Do not publish the URI or credentials in logs or screenshots.
