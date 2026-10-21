@@ -6,21 +6,38 @@ import { connectDatabase } from "../config/database.js";
 import { User } from "../models/User.js";
 import { unauthorized } from "../utils/apiError.js";
 
-export async function login({ username, password }) {
-  // Ensure MongoDB is connected before querying.
+export async function login({ username, password } = {}) {
   await connectDatabase();
 
-  const normalizedUsername = String(username).toLowerCase();
+  // Validate request body before using bcrypt.
+  if (
+    typeof username !== "string" ||
+    typeof password !== "string" ||
+    !username.trim() ||
+    !password
+  ) {
+    throw unauthorized("Invalid username or password");
+  }
+
+  const normalizedUsername = username.trim().toLowerCase();
 
   const user = await User.findOne({
     username: normalizedUsername,
   }).select("+passwordHash");
 
+  // Validate the account and stored hash.
   if (
     !user ||
     !user.isActive ||
-    !(await bcrypt.compare(password, user.passwordHash))
+    typeof user.passwordHash !== "string" ||
+    !user.passwordHash
   ) {
+    throw unauthorized("Invalid username or password");
+  }
+
+  const passwordMatches = await bcrypt.compare(password, user.passwordHash);
+
+  if (!passwordMatches) {
     throw unauthorized("Invalid username or password");
   }
 
