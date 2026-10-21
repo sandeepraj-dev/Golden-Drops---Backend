@@ -15,7 +15,7 @@ const app = express();
 
 // FIX: Configure proxy trust for Vercel.
 // Do this before express-rate-limit.
-app.set("trust proxy", 1);
+app.set("trust proxy", true);
 
 app.disable("x-powered-by");
 
@@ -45,9 +45,9 @@ app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 app.use(
   rateLimit({
-    windowMs: env.RATE_LIMIT_WINDOW_MS,
-    limit: env.RATE_LIMIT_MAX,
-    standardHeaders: "draft-7",
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    limit: 100, // 100 requests per client per window
+    standardHeaders: "draft-8",
     legacyHeaders: false,
   }),
 );
@@ -60,7 +60,13 @@ app.get("/", (_req, res) =>
     health: "/api/v1/health",
   }),
 );
-
+app.get("/api/debug-ip", (req, res) => {
+  res.json({
+    ip: req.ip,
+    ips: req.ips,
+    trustProxy: app.get("trust proxy"),
+  });
+});
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const openapiPath = path.resolve(__dirname, "../docs/openapi.yaml");
 
