@@ -1,8 +1,7 @@
-import mongoose from "mongoose";
 import { Customer, Supplier, OilType, StorageLocation, Purchase, Sale, Payment, StockLedger } from "../models/index.js";
 import { withTransaction } from "../config/database.js";
 import { getPriceAt } from "./price.service.js";
-import { createMovement } from "./stock.service.js";
+import { createMovement, stockAt } from "./stock.service.js";
 import { nextNumber } from "./numbering.service.js";
 import { roundMoney, sumMoney } from "../utils/money.js";
 import { badRequest, notFound, conflict } from "../utils/apiError.js";
@@ -21,6 +20,8 @@ function paymentStatus(total, paid) {
  * inventory. StockLedger is the source of truth for current stock.
  */
 async function ensureInvoiceStockLedger(session) {
+  // Repair legacy invoices per line item, not per invoice. A partially populated
+  // ledger must not prevent missing oil/location movements from being recovered.
   const invoices = [
     { Model: Purchase, referenceType: "PURCHASE", movementType: "PURCHASE", incoming: true },
     { Model: Sale, referenceType: "SALE", movementType: "SALE", incoming: false },
@@ -28,16 +29,17 @@ async function ensureInvoiceStockLedger(session) {
   for (const config of invoices) {
     const docs = await config.Model.find({ status: "CONFIRMED" }).session(session).lean();
     for (const doc of docs) {
-      const existing = await StockLedger.countDocuments({
-        referenceType: config.referenceType,
-        referenceId: doc._id,
-      }).session(session);
-      if (existing > 0) continue;
       const date = doc.purchaseDate || doc.saleDate || doc.createdAt || new Date();
-      const numberPrefix = config.incoming ? "PUR" : "SAL";
       for (const item of (doc.items || [])) {
-        // Legacy invoices without a storage location cannot be safely assigned.
         if (!item.oilTypeId || !item.storageLocationId || !(Number(item.quantityKg) > 0)) continue;
+        const identity = {
+          referenceType: config.referenceType,
+          referenceId: doc._id,
+          oilTypeId: item.oilTypeId,
+          storageLocationId: item.storageLocationId,
+        };
+        const existing = await StockLedger.exists(identity).session(session);
+        if (existing) continue;
         const movementNumber = await nextNumber("MOV", date, session);
         await StockLedger.create([{
           movementNumber,
@@ -47,16 +49,19 @@ async function ensureInvoiceStockLedger(session) {
           movementType: config.movementType,
           quantityInKg: config.incoming ? Number(item.quantityKg) : 0,
           quantityOutKg: config.incoming ? 0 : Number(item.quantityKg),
-          unitCostPerKg: config.incoming ? Number(item.purchasePricePerKg || item.unitCostPerKg || 0) : Number(item.unitCostPerKg || 0),
+          unitCostPerKg: config.incoming
+            ? Number(item.purchasePricePerKg || item.unitCostPerKg || 0)
+            : Number(item.unitCostPerKg || 0),
           referenceType: config.referenceType,
           referenceId: doc._id,
-          notes: `Ledger backfill from ${numberPrefix} invoice ${doc.purchaseNumber || doc.saleNumber || doc._id}`,
+          notes: `Ledger recovery from ${config.incoming ? "purchase" : "sale"} ${doc.purchaseNumber || doc.saleNumber || doc._id}`,
           createdBy: doc.createdBy,
         }], { session });
       }
     }
   }
 }
+
 async function calculateItems(items, kind, date, session, allowOverride, actorRole) {
   const out = [];
   for (const item of items) {
@@ -132,11 +137,9 @@ export async function createSale(data, actor) {
     // Stock is calculated from StockLedger: sum(quantityInKg) - sum(quantityOutKg)
     // for the same oil type AND storage location, inside this Mongo transaction.
     for (const item of items) {
-      const rows = await StockLedger.aggregate([
-        { $match: { oilTypeId: new mongoose.Types.ObjectId(item.oilTypeId), storageLocationId: new mongoose.Types.ObjectId(item.storageLocationId) } },
-        { $group: { _id: null, incoming: { $sum: "$quantityInKg" }, outgoing: { $sum: "$quantityOutKg" } } }
-      ]).session(session);
-      const available = rows.length ? rows[0].incoming - rows[0].outgoing : 0;
+      // Use the shared stock calculation so string IDs from API payloads and
+      // ObjectIds from MongoDB are normalized consistently.
+      const available = await stockAt(item.oilTypeId, item.storageLocationId, session);
       if (available + 1e-9 < item.quantityKg) throw conflict("Insufficient stock at the selected storage location", { oilTypeId: item.oilTypeId, storageLocationId: item.storageLocationId, availableKg: available, requestedKg: item.quantityKg, hint: "Stock is calculated from StockLedger quantityInKg minus quantityOutKg for this oil type and storage location. Verify that the purchase uses the same storageLocationId and that its ledger movement exists." });
     }
     const t = totals(items, data.additionalCharges, data.discount);

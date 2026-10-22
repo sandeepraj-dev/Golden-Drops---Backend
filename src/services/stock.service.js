@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { StockLedger, OilType, StorageLocation } from "../models/index.js";
 import { nextNumber } from "./numbering.service.js";
 import { badRequest, notFound, conflict } from "../utils/apiError.js";
@@ -17,8 +18,23 @@ export async function getStock({ oilTypeId, storageLocationId, session } = {}) {
   return rows;
 }
 export async function stockAt(oilTypeId, storageLocationId, session) {
+  // Aggregation pipelines do not automatically cast string IDs to ObjectIds.
+  // Sale request payloads commonly contain string IDs, while StockLedger stores ObjectIds.
+  // Normalize both IDs before matching so stock is not incorrectly reported as zero.
+  let normalizedOilTypeId;
+  let normalizedStorageLocationId;
+  try {
+    normalizedOilTypeId = oilTypeId instanceof mongoose.Types.ObjectId
+      ? oilTypeId
+      : new mongoose.Types.ObjectId(String(oilTypeId));
+    normalizedStorageLocationId = storageLocationId instanceof mongoose.Types.ObjectId
+      ? storageLocationId
+      : new mongoose.Types.ObjectId(String(storageLocationId));
+  } catch {
+    throw badRequest("Invalid oilTypeId or storageLocationId for stock lookup");
+  }
   const rows = await StockLedger.aggregate([
-    { $match: { oilTypeId, storageLocationId } },
+    { $match: { oilTypeId: normalizedOilTypeId, storageLocationId: normalizedStorageLocationId } },
     { $group: { _id: null, incoming: { $sum: "$quantityInKg" }, outgoing: { $sum: "$quantityOutKg" } } }
   ]).session(session || null);
   return rows.length ? rows[0].incoming - rows[0].outgoing : 0;
@@ -31,9 +47,8 @@ export async function createMovement(data, actor, session) {
   if (!(await OilType.exists({ _id: data.oilTypeId, isActive: true }).session(session))) throw notFound("Active oil type not found");
   if (!(await StorageLocation.exists({ _id: data.storageLocationId, isActive: true }).session(session))) throw notFound("Active storage location not found");
   if (data.quantityOutKg > 0) {
-    // Atomic conditional reservation: a per-location stock balance document is recommended
-    // for high-throughput deployments. The transaction snapshot plus this ledger check
-    // should be paired with an inventory-balance write to serialize concurrent sales.
+    // Normalize IDs in stockAt before aggregation; MongoDB aggregation does not cast IDs.
+    // The sale flow also validates stock before writing the outbound movement.
     const available = await stockAt(data.oilTypeId, data.storageLocationId, session);
     if (available + 1e-9 < data.quantityOutKg) throw conflict("Insufficient stock", { availableKg: available, requestedKg: data.quantityOutKg });
   }
