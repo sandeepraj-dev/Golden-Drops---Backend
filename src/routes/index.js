@@ -77,7 +77,8 @@ router.get("/purchases/:id/pdf", tx.invoicePdf("PURCHASE"));
 router.get("/sales", tx.salesList);
 router.post("/sales", staff, validate(saleSchema), tx.saleCreate);
 router.get("/sales/:id", tx.saleGet);
-router.post("/sales/:id/reverse", manager, tx.saleReverse);\nrouter.get("/sales/:id/pdf", tx.invoicePdf("SALE"));
+router.post("/sales/:id/reverse", manager, tx.saleReverse);
+router.get("/sales/:id/pdf", tx.invoicePdf("SALE"));
 
 router.get("/payments", tx.paymentsList);
 router.post("/payments", staff, validate(paymentSchema), tx.paymentCreate);
@@ -85,7 +86,8 @@ router.get("/payments/:id/receipt.pdf", tx.paymentReceiptPdf);
 
 router.get("/stock", tx.stockList);
 router.get("/stock/ledger", tx.stockLedgerList);
-router.post("/stock/opening", manager, tx.openingStock);\nrouter.post("/stock/dispatch", staff, tx.dispatchStock);
+router.post("/stock/opening", manager, tx.openingStock);
+router.post("/stock/dispatch", staff, tx.dispatchStock);
 router.get("/daily-stock", tx.dailyStockList);
 router.post("/daily-stock/generate", staff, tx.dailyStockGenerate);
 router.patch("/daily-stock/:id/physical-count", staff, tx.dailyStockPhysical);
@@ -101,6 +103,5 @@ router.get("/customers/:id/statement", tx.customerStatementController);
 router.get("/customers/:id/statement.pdf", tx.customerStatementController);
 router.get("/suppliers/:id/statement", tx.supplierStatementController);
 router.get("/audit-logs", manager, tx.auditList);
-
 
 export default router;
