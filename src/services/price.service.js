@@ -3,67 +3,28 @@ import { badRequest, notFound, conflict } from "../utils/apiError.js";
 import { writeAudit } from "./audit.service.js";
 
 export async function createPrice(data, actor) {
-  const priceType = String(data.priceType || "")
-    .trim()
-    .toUpperCase();
-  const pricePerKg = Number(data.pricePerKg);
-
-  if (!["PURCHASE", "SELL"].includes(priceType)) {
-    throw badRequest("priceType must be PURCHASE or SELL");
-  }
-
-  if (!Number.isFinite(pricePerKg) || pricePerKg <= 0) {
+  if (data.pricePerKg <= 0)
     throw badRequest("pricePerKg must be greater than zero");
-  }
-
-  if (
-    !(await OilType.exists({
-      _id: data.oilTypeId,
-      isActive: true,
-    }))
-  ) {
+  if (!(await OilType.exists({ _id: data.oilTypeId, isActive: true })))
     throw notFound("Active oil type not found");
-  }
-
+  const end = data.effectiveTo
+    ? new Date(data.effectiveTo)
+    : new Date("9999-12-31T23:59:59.999Z");
   const start = new Date(data.effectiveFrom);
-
-  if (!data.effectiveFrom || Number.isNaN(start.getTime())) {
-    throw badRequest("A valid effectiveFrom date is required");
-  }
-
-  const end = data.effectiveTo ? new Date(data.effectiveTo) : null;
-
-  if (end && (Number.isNaN(end.getTime()) || start >= end)) {
+  if (start >= end)
     throw badRequest("effectiveFrom must be earlier than effectiveTo");
-  }
-
   const overlap = await OilPrice.findOne({
     oilTypeId: data.oilTypeId,
-    priceType,
+    priceType: data.priceType,
     isActive: true,
+    effectiveFrom: { $lt: end },
     $or: [{ effectiveTo: null }, { effectiveTo: { $gt: start } }],
   });
-
-  if (overlap) {
+  if (overlap)
     throw conflict("Price period overlaps an existing active price", {
       existingPriceId: overlap.id,
-      existingPriceType: overlap.priceType,
-      existingPricePerKg: overlap.pricePerKg,
-      existingEffectiveFrom: overlap.effectiveFrom,
-      existingEffectiveTo: overlap.effectiveTo,
-      requestedPriceType: priceType,
     });
-  }
-
-  const price = await OilPrice.create({
-    ...data,
-    priceType,
-    pricePerKg,
-    effectiveFrom: start,
-    effectiveTo: end,
-    createdBy: actor.id,
-  });
-
+  const price = await OilPrice.create({ ...data, createdBy: actor.id });
   await writeAudit({
     userId: actor.id,
     action: "CREATE_PRICE",
@@ -71,10 +32,8 @@ export async function createPrice(data, actor) {
     entityId: price._id,
     after: price.toObject(),
   });
-
   return price;
 }
-
 export async function getPriceAt({ oilTypeId, priceType, date }) {
   const when = new Date(date);
   const price = await OilPrice.findOne({
