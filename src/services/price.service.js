@@ -6,7 +6,12 @@ export async function createPrice(data, actor) {
   const priceType = String(data.priceType || "")
     .trim()
     .toUpperCase();
+
   const pricePerKg = Number(data.pricePerKg);
+
+  // Support both a plain ObjectId string and a populated oil object.
+  const oilTypeId =
+    data.oilTypeId?._id?.toString?.() || data.oilTypeId?.toString?.();
 
   if (!["PURCHASE", "SELL"].includes(priceType)) {
     throw badRequest("priceType must be PURCHASE or SELL");
@@ -16,50 +21,78 @@ export async function createPrice(data, actor) {
     throw badRequest("pricePerKg must be greater than zero");
   }
 
-  if (
-    !(await OilType.exists({
-      _id: data.oilTypeId,
-      isActive: true,
-    }))
-  ) {
-    throw notFound("Active oil type not found");
+  if (!oilTypeId) {
+    throw badRequest("Valid oilTypeId is required");
+  }
+
+  const activeOil = await OilType.exists({
+    _id: oilTypeId,
+    isActive: true,
+  });
+
+  if (!activeOil) {
+    throw notFound(`Active oil type not found: ${oilTypeId}`);
+  }
+
+  if (!data.effectiveFrom) {
+    throw badRequest("effectiveFrom is required");
   }
 
   const start = new Date(data.effectiveFrom);
 
-  if (!data.effectiveFrom || Number.isNaN(start.getTime())) {
-    throw badRequest("A valid effectiveFrom date is required");
+  if (Number.isNaN(start.getTime())) {
+    throw badRequest("Invalid effectiveFrom date");
   }
 
-  const end = data.effectiveTo ? new Date(data.effectiveTo) : null;
+  const end =
+    data.effectiveTo == null || data.effectiveTo === ""
+      ? null
+      : new Date(data.effectiveTo);
 
-  if (end && (Number.isNaN(end.getTime()) || start >= end)) {
+  if (end && Number.isNaN(end.getTime())) {
+    throw badRequest("Invalid effectiveTo date");
+  }
+
+  if (end && start >= end) {
     throw badRequest("effectiveFrom must be earlier than effectiveTo");
   }
 
-  const overlap = await OilPrice.findOne({
-    oilTypeId: data.oilTypeId,
+  // Match only the same oil AND the same price type.
+  const overlapQuery = {
+    oilTypeId,
     priceType,
     isActive: true,
-    effectiveFrom: {
-      ...(end ? { $lt: end } : {}),
-    },
     $or: [{ effectiveTo: null }, { effectiveTo: { $gt: start } }],
-  });
+  };
+
+  // If the new period has an end date, the existing period
+  // must start before that end date to overlap.
+  // If end is null, the new period continues indefinitely.
+  if (end) {
+    overlapQuery.effectiveFrom = { $lt: end };
+  }
+
+  const overlap = await OilPrice.findOne(overlapQuery);
 
   if (overlap) {
-    throw conflict("Price period overlaps an existing active price", {
-      existingPriceId: overlap.id,
-      existingPriceType: overlap.priceType,
-      existingPricePerKg: overlap.pricePerKg,
-      existingEffectiveFrom: overlap.effectiveFrom,
-      existingEffectiveTo: overlap.effectiveTo,
-      requestedPriceType: priceType,
-    });
+    throw conflict(
+      `An active ${priceType} price already overlaps this period`,
+      {
+        requestedOilTypeId: oilTypeId,
+        requestedPriceType: priceType,
+        existingPriceId: overlap._id.toString(),
+        existingOilTypeId: overlap.oilTypeId.toString(),
+        existingPriceType: overlap.priceType,
+        existingPricePerKg: overlap.pricePerKg,
+        existingEffectiveFrom: overlap.effectiveFrom,
+        existingEffectiveTo: overlap.effectiveTo,
+      },
+    );
   }
 
   const price = await OilPrice.create({
     ...data,
+    oilTypeId,
     priceType,
     pricePerKg,
     effectiveFrom: start,
