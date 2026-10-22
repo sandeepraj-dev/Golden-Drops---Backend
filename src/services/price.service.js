@@ -77,48 +77,50 @@ export async function createPrice(data, actor) {
 
 export async function getPriceAt({ oilTypeId, priceType, date }) {
   const when = date ? new Date(date) : new Date();
-  const normalizedType = String(priceType || "").trim().toUpperCase();
+  const requestedType = String(priceType || "").trim().toUpperCase();
+
   if (!Number.isFinite(when.getTime())) {
     throw badRequest("A valid transaction date is required to resolve the oil price");
   }
-  if (!["PURCHASE", "SELL"].includes(normalizedType)) {
+  if (!["PURCHASE", "SELL", "SALE", "SALES"].includes(requestedType)) {
     throw badRequest("priceType must be PURCHASE or SELL");
   }
 
-  // First use the effective-date rules for current price records.
+  // The transaction API commonly receives a date-only value (YYYY-MM-DD).
+  // JavaScript parses that as midnight UTC, which incorrectly excludes a price
+  // configured later on the same day. For date-only values, match any price
+  // that was effective at some point during that calendar day.
+  const dateOnly = (typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) ||
+    (date instanceof Date && when.getUTCHours() === 0 && when.getUTCMinutes() === 0 &&
+      when.getUTCSeconds() === 0 && when.getUTCMilliseconds() === 0);
+  const dayStart = new Date(Date.UTC(when.getUTCFullYear(), when.getUTCMonth(), when.getUTCDate()));
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000 - 1);
+  const effectiveFromLimit = dateOnly ? dayEnd : when;
+  const effectiveToLimit = dateOnly ? dayStart : when;
+
+  // Accept legacy SALE/SALES values for sales, while new records use SELL.
+  const typeAliases = requestedType === "PURCHASE"
+    ? ["PURCHASE", "purchase"]
+    : ["SELL", "SALE", "SALES", "sell", "sale", "sales"];
+
   const price = await OilPrice.findOne({
     oilTypeId,
-    priceType: normalizedType,
+    priceType: { $in: typeAliases },
     isActive: true,
-    effectiveFrom: { $lte: when },
-    $or: [{ effectiveTo: null }, { effectiveTo: { $gt: when } }],
-  }).sort({ effectiveFrom: -1 });
-  if (price) return price;
+    effectiveFrom: { $lte: effectiveFromLimit },
+    $or: [{ effectiveTo: null }, { effectiveTo: { $gt: effectiveToLimit } }],
+    pricePerKg: { $gt: 0 },
+  }).sort({ effectiveFrom: -1, createdAt: -1 });
 
-  // Backward compatibility for older price records imported before effectiveFrom
-  // was required, or records saved with lowercase priceType values. A legacy
-  // record is usable only if it has a valid positive price and is active.
-  const legacyRows = await OilPrice.find({
-    oilTypeId,
-    isActive: true,
-    priceType: { $in: [normalizedType, normalizedType.toLowerCase()] },
-  }).sort({ effectiveFrom: -1, createdAt: -1 }).lean();
-  const legacy = legacyRows.find((row) => {
-    const value = Number(row.pricePerKg);
-    if (!Number.isFinite(value) || value <= 0) return false;
-    const startValue = row.effectiveFrom || row.createdAt;
-    const start = startValue ? new Date(startValue) : null;
-    if (start && Number.isFinite(start.getTime()) && start > when) return false;
-    const end = row.effectiveTo ? new Date(row.effectiveTo) : null;
-    if (end && Number.isFinite(end.getTime()) && end <= when) return false;
-    return true;
-  });
-  if (legacy) return legacy;
-
-  throw notFound(
-    `No ${normalizedType.toLowerCase()} price configured for oil type ${oilTypeId} on ${when.toISOString().slice(0, 10)}. Check OilPrice records: oilTypeId must match the OilType _id, priceType must be ${normalizedType}, isActive must be true, and effectiveFrom must be on or before the transaction date.`,
-  );
+  if (!price) {
+    const dayLabel = dateOnly ? date.trim() : when.toISOString();
+    throw notFound(
+      `No ${requestedType === "PURCHASE" ? "purchase" : "sales"} price configured for oil type ${oilTypeId} on ${dayLabel}. Check OilPrice records: oilTypeId must match the OilType _id, priceType must be ${requestedType === "PURCHASE" ? "PURCHASE" : "SELL/SALE/SALES"}, isActive must be true, and the effective date range must include the transaction date.`,
+    );
+  }
+  return price;
 }
+
 export async function priceHistory(query) {
   const filter = {};
   if (query.oilTypeId) filter.oilTypeId = query.oilTypeId;
