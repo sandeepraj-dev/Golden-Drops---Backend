@@ -1,4 +1,3 @@
-import mongoose from "mongoose";
 import { Customer, Supplier, OilType, StorageLocation, Purchase, Sale, Payment, StockLedger } from "../models/index.js";
 import { withTransaction } from "../config/database.js";
 import { getPriceAt } from "./price.service.js";
@@ -13,6 +12,56 @@ function paymentStatus(total, paid) {
   if (paid + 0.00001 >= total) return "PAID";
   return "PARTIALLY_PAID";
 }
+
+/**
+ * Backfill the inventory ledger for legacy confirmed invoices created before
+ * stock movements were reliably written. An invoice is backfilled only when
+ * it has no ledger movements at all, so repeated sale requests cannot duplicate
+ * inventory. StockLedger is the source of truth for current stock.
+ */
+async function ensureInvoiceStockLedger(session) {
+  // Repair legacy invoices per line item, not per invoice. A partially populated
+  // ledger must not prevent missing oil/location movements from being recovered.
+  const invoices = [
+    { Model: Purchase, referenceType: "PURCHASE", movementType: "PURCHASE", incoming: true },
+    { Model: Sale, referenceType: "SALE", movementType: "SALE", incoming: false },
+  ];
+  for (const config of invoices) {
+    const docs = await config.Model.find({ status: "CONFIRMED" }).session(session).lean();
+    for (const doc of docs) {
+      const date = doc.purchaseDate || doc.saleDate || doc.createdAt || new Date();
+      for (const item of (doc.items || [])) {
+        if (!item.oilTypeId || !item.storageLocationId || !(Number(item.quantityKg) > 0)) continue;
+        const identity = {
+          referenceType: config.referenceType,
+          referenceId: doc._id,
+          oilTypeId: item.oilTypeId,
+          storageLocationId: item.storageLocationId,
+        };
+        const existing = await StockLedger.exists(identity).session(session);
+        if (existing) continue;
+        const movementNumber = await nextNumber("MOV", date, session);
+        await StockLedger.create([{
+          movementNumber,
+          movementDate: date,
+          oilTypeId: item.oilTypeId,
+          storageLocationId: item.storageLocationId,
+          movementType: config.movementType,
+          quantityInKg: config.incoming ? Number(item.quantityKg) : 0,
+          quantityOutKg: config.incoming ? 0 : Number(item.quantityKg),
+          unitCostPerKg: config.incoming
+            ? Number(item.purchasePricePerKg || item.unitCostPerKg || 0)
+            : Number(item.unitCostPerKg || 0),
+          referenceType: config.referenceType,
+          referenceId: doc._id,
+          notes: `Ledger recovery from ${config.incoming ? "purchase" : "sale"} ${doc.purchaseNumber || doc.saleNumber || doc._id}`,
+          createdBy: doc.createdBy,
+        }], { session });
+      }
+    }
+  }
+}
+
 async function calculateItems(items, kind, date, session, allowOverride, actorRole) {
   const out = [];
   for (const item of items) {
@@ -82,19 +131,16 @@ export async function createSale(data, actor) {
     if (customerId && !(await Customer.exists({ _id: customerId, isActive: true }).session(session))) throw notFound("Active customer not found");
     const date = new Date(data.saleDate || Date.now());
     const items = await calculateItems(data.items, "SALE", date, session, true, actor.role);
-    // Use the same stock calculation as the stock API and movement service.
-    // It includes ledger movements plus legacy confirmed invoice lines missing a ledger row.
+    // Older confirmed invoices may predate StockLedger movement creation.
+    // Rebuild only completely missing invoice movements before checking balance.
+    await ensureInvoiceStockLedger(session);
+    // Stock is calculated from StockLedger: sum(quantityInKg) - sum(quantityOutKg)
+    // for the same oil type AND storage location, inside this Mongo transaction.
     for (const item of items) {
+      // Use the shared stock calculation so string IDs from API payloads and
+      // ObjectIds from MongoDB are normalized consistently.
       const available = await stockAt(item.oilTypeId, item.storageLocationId, session);
-      if (available + 1e-9 < item.quantityKg) {
-        throw conflict("Insufficient stock for this oil type at the selected storage location", {
-          oilTypeId: String(item.oilTypeId),
-          storageLocationId: String(item.storageLocationId),
-          availableKg: Math.max(0, Number(available.toFixed(6))),
-          requestedKg: item.quantityKg,
-          hint: "Stock is calculated from StockLedger plus confirmed legacy purchase/sale invoice lines without matching ledger movements. Confirm the purchase is saved, not reversed, and uses the same oil type and storage location."
-        });
-      }
+      if (available + 1e-9 < item.quantityKg) throw conflict("Insufficient stock at the selected storage location", { oilTypeId: item.oilTypeId, storageLocationId: item.storageLocationId, availableKg: available, requestedKg: item.quantityKg, hint: "Stock is calculated from StockLedger quantityInKg minus quantityOutKg for this oil type and storage location. Verify that the purchase uses the same storageLocationId and that its ledger movement exists." });
     }
     const t = totals(items, data.additionalCharges, data.discount);
     const saleNumber = await nextNumber("SAL", date, session);
