@@ -1,25 +1,63 @@
 import { Router } from "express";
 import { authenticate, authorize } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
-import { loginSchema, masterCreateSchema, masterPatchSchema, priceSchema, purchaseSchema, saleSchema, paymentSchema } from "../validators/schemas.js";
-import { loginController, setupAdminController } from "../controllers/auth.controller.js";
+import {
+  loginSchema,
+  masterCreateSchema,
+  masterPatchSchema,
+  priceSchema,
+  purchaseSchema,
+  saleSchema,
+  paymentSchema,
+} from "../validators/schemas.js";
+import {
+  loginController,
+  setupAdminController,
+} from "../controllers/auth.controller.js";
 import * as master from "../controllers/master.controller.js";
 import * as tx from "../controllers/transaction.controller.js";
 
 const router = Router();
 const admin = authorize("ADMIN");
-const manager = authorize("ADMIN","MANAGER");
-const staff = authorize("ADMIN","MANAGER","STAFF");
+const manager = authorize("ADMIN", "MANAGER");
+const staff = authorize("ADMIN", "MANAGER", "STAFF");
 router.post("/auth/setup-admin", setupAdminController);
 router.post("/auth/login", validate(loginSchema), loginController);
-router.get("/health", (_req,res)=>res.json({success:true,data:{status:"ok",time:new Date().toISOString()}}));
+router.get("/health", (_req, res) =>
+  res.json({
+    success: true,
+    data: { status: "ok", time: new Date().toISOString() },
+  }),
+);
 router.use(authenticate);
 
-for (const [path,kind] of [["customers","customers"],["suppliers","suppliers"],["oil-types","oil-types"],["storage-locations","storage-locations"]]) {
+for (const [path, kind] of [
+  ["customers", "customers"],
+  ["suppliers", "suppliers"],
+  ["oil-types", "oil-types"],
+  ["storage-locations", "storage-locations"],
+]) {
   router.get(`/${path}`, master.list(kind));
-  router.post(`/${path}`, manager, validate(masterCreateSchema), master.create(kind));
+  router.post(
+    `/${path}`,
+    manager,
+    validate(masterCreateSchema),
+    master.create(kind),
+  );
   router.get(`/${path}/:id`, master.get(kind));
-  router.patch(`/${path}/:id`, manager, validate(masterPatchSchema), master.update(kind));
+  router.patch(
+    `/${path}/:id`,
+    manager,
+    validate(masterPatchSchema),
+    master.update(kind),
+  );
+  // PUT is a compatibility alias; partial updates use the same validation.
+  router.put(
+    `/${path}/:id`,
+    manager,
+    validate(masterPatchSchema),
+    master.update(kind),
+  );
   router.delete(`/${path}/:id`, manager, master.deactivate(kind));
 }
 router.get("/users", admin, master.usersList);
@@ -63,5 +101,6 @@ router.get("/customers/:id/statement", tx.customerStatementController);
 router.get("/customers/:id/statement.pdf", tx.customerStatementController);
 router.get("/suppliers/:id/statement", tx.supplierStatementController);
 router.get("/audit-logs", manager, tx.auditList);
+
 
 export default router;
