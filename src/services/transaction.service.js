@@ -13,6 +13,50 @@ function paymentStatus(total, paid) {
   if (paid + 0.00001 >= total) return "PAID";
   return "PARTIALLY_PAID";
 }
+
+/**
+ * Backfill the inventory ledger for legacy confirmed invoices created before
+ * stock movements were reliably written. An invoice is backfilled only when
+ * it has no ledger movements at all, so repeated sale requests cannot duplicate
+ * inventory. StockLedger is the source of truth for current stock.
+ */
+async function ensureInvoiceStockLedger(session) {
+  const invoices = [
+    { Model: Purchase, referenceType: "PURCHASE", movementType: "PURCHASE", incoming: true },
+    { Model: Sale, referenceType: "SALE", movementType: "SALE", incoming: false },
+  ];
+  for (const config of invoices) {
+    const docs = await config.Model.find({ status: "CONFIRMED" }).session(session).lean();
+    for (const doc of docs) {
+      const existing = await StockLedger.countDocuments({
+        referenceType: config.referenceType,
+        referenceId: doc._id,
+      }).session(session);
+      if (existing > 0) continue;
+      const date = doc.purchaseDate || doc.saleDate || doc.createdAt || new Date();
+      const numberPrefix = config.incoming ? "PUR" : "SAL";
+      for (const item of (doc.items || [])) {
+        // Legacy invoices without a storage location cannot be safely assigned.
+        if (!item.oilTypeId || !item.storageLocationId || !(Number(item.quantityKg) > 0)) continue;
+        const movementNumber = await nextNumber("MOV", date, session);
+        await StockLedger.create([{
+          movementNumber,
+          movementDate: date,
+          oilTypeId: item.oilTypeId,
+          storageLocationId: item.storageLocationId,
+          movementType: config.movementType,
+          quantityInKg: config.incoming ? Number(item.quantityKg) : 0,
+          quantityOutKg: config.incoming ? 0 : Number(item.quantityKg),
+          unitCostPerKg: config.incoming ? Number(item.purchasePricePerKg || item.unitCostPerKg || 0) : Number(item.unitCostPerKg || 0),
+          referenceType: config.referenceType,
+          referenceId: doc._id,
+          notes: `Ledger backfill from ${numberPrefix} invoice ${doc.purchaseNumber || doc.saleNumber || doc._id}`,
+          createdBy: doc.createdBy,
+        }], { session });
+      }
+    }
+  }
+}
 async function calculateItems(items, kind, date, session, allowOverride, actorRole) {
   const out = [];
   for (const item of items) {
@@ -82,14 +126,18 @@ export async function createSale(data, actor) {
     if (customerId && !(await Customer.exists({ _id: customerId, isActive: true }).session(session))) throw notFound("Active customer not found");
     const date = new Date(data.saleDate || Date.now());
     const items = await calculateItems(data.items, "SALE", date, session, true, actor.role);
-    // Re-check stock in the transaction before creating the invoice.
+    // Older confirmed invoices may predate StockLedger movement creation.
+    // Rebuild only completely missing invoice movements before checking balance.
+    await ensureInvoiceStockLedger(session);
+    // Stock is calculated from StockLedger: sum(quantityInKg) - sum(quantityOutKg)
+    // for the same oil type AND storage location, inside this Mongo transaction.
     for (const item of items) {
       const rows = await StockLedger.aggregate([
         { $match: { oilTypeId: new mongoose.Types.ObjectId(item.oilTypeId), storageLocationId: new mongoose.Types.ObjectId(item.storageLocationId) } },
         { $group: { _id: null, incoming: { $sum: "$quantityInKg" }, outgoing: { $sum: "$quantityOutKg" } } }
       ]).session(session);
       const available = rows.length ? rows[0].incoming - rows[0].outgoing : 0;
-      if (available + 1e-9 < item.quantityKg) throw conflict("Insufficient stock", { oilTypeId: item.oilTypeId, availableKg: available, requestedKg: item.quantityKg });
+      if (available + 1e-9 < item.quantityKg) throw conflict("Insufficient stock at the selected storage location", { oilTypeId: item.oilTypeId, storageLocationId: item.storageLocationId, availableKg: available, requestedKg: item.quantityKg, hint: "Stock is calculated from StockLedger quantityInKg minus quantityOutKg for this oil type and storage location. Verify that the purchase uses the same storageLocationId and that its ledger movement exists." });
     }
     const t = totals(items, data.additionalCharges, data.discount);
     const saleNumber = await nextNumber("SAL", date, session);
