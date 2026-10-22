@@ -3,28 +3,67 @@ import { badRequest, notFound, conflict } from "../utils/apiError.js";
 import { writeAudit } from "./audit.service.js";
 
 export async function createPrice(data, actor) {
-  if (data.pricePerKg <= 0)
+  const priceType = String(data.priceType || "")
+    .trim()
+    .toUpperCase();
+  const pricePerKg = Number(data.pricePerKg);
+
+  if (!["PURCHASE", "SELL"].includes(priceType)) {
+    throw badRequest("priceType must be PURCHASE or SELL");
+  }
+
+  if (!Number.isFinite(pricePerKg) || pricePerKg <= 0) {
     throw badRequest("pricePerKg must be greater than zero");
-  if (!(await OilType.exists({ _id: data.oilTypeId, isActive: true })))
+  }
+
+  if (
+    !(await OilType.exists({
+      _id: data.oilTypeId,
+      isActive: true,
+    }))
+  ) {
     throw notFound("Active oil type not found");
-  const end = data.effectiveTo
-    ? new Date(data.effectiveTo)
-    : new Date("9999-12-31T23:59:59.999Z");
+  }
+
   const start = new Date(data.effectiveFrom);
-  if (start >= end)
+
+  if (!data.effectiveFrom || Number.isNaN(start.getTime())) {
+    throw badRequest("A valid effectiveFrom date is required");
+  }
+
+  const end = data.effectiveTo ? new Date(data.effectiveTo) : null;
+
+  if (end && (Number.isNaN(end.getTime()) || start >= end)) {
     throw badRequest("effectiveFrom must be earlier than effectiveTo");
+  }
+
   const overlap = await OilPrice.findOne({
     oilTypeId: data.oilTypeId,
-    priceType: data.priceType,
+    priceType,
     isActive: true,
-    effectiveFrom: { $lt: end },
     $or: [{ effectiveTo: null }, { effectiveTo: { $gt: start } }],
   });
-  if (overlap)
+
+  if (overlap) {
     throw conflict("Price period overlaps an existing active price", {
       existingPriceId: overlap.id,
+      existingPriceType: overlap.priceType,
+      existingPricePerKg: overlap.pricePerKg,
+      existingEffectiveFrom: overlap.effectiveFrom,
+      existingEffectiveTo: overlap.effectiveTo,
+      requestedPriceType: priceType,
     });
-  const price = await OilPrice.create({ ...data, createdBy: actor.id });
+  }
+
+  const price = await OilPrice.create({
+    ...data,
+    priceType,
+    pricePerKg,
+    effectiveFrom: start,
+    effectiveTo: end,
+    createdBy: actor.id,
+  });
+
   await writeAudit({
     userId: actor.id,
     action: "CREATE_PRICE",
@@ -32,22 +71,53 @@ export async function createPrice(data, actor) {
     entityId: price._id,
     after: price.toObject(),
   });
+
   return price;
 }
+
 export async function getPriceAt({ oilTypeId, priceType, date }) {
-  const when = new Date(date);
+  const when = date ? new Date(date) : new Date();
+  const normalizedType = String(priceType || "").trim().toUpperCase();
+  if (!Number.isFinite(when.getTime())) {
+    throw badRequest("A valid transaction date is required to resolve the oil price");
+  }
+  if (!["PURCHASE", "SELL"].includes(normalizedType)) {
+    throw badRequest("priceType must be PURCHASE or SELL");
+  }
+
+  // First use the effective-date rules for current price records.
   const price = await OilPrice.findOne({
     oilTypeId,
-    priceType,
+    priceType: normalizedType,
     isActive: true,
     effectiveFrom: { $lte: when },
     $or: [{ effectiveTo: null }, { effectiveTo: { $gt: when } }],
   }).sort({ effectiveFrom: -1 });
-  if (!price)
-    throw notFound(
-      `No ${priceType.toLowerCase()} price configured for this oil type and date`,
-    );
-  return price;
+  if (price) return price;
+
+  // Backward compatibility for older price records imported before effectiveFrom
+  // was required, or records saved with lowercase priceType values. A legacy
+  // record is usable only if it has a valid positive price and is active.
+  const legacyRows = await OilPrice.find({
+    oilTypeId,
+    isActive: true,
+    priceType: { $in: [normalizedType, normalizedType.toLowerCase()] },
+  }).sort({ effectiveFrom: -1, createdAt: -1 }).lean();
+  const legacy = legacyRows.find((row) => {
+    const value = Number(row.pricePerKg);
+    if (!Number.isFinite(value) || value <= 0) return false;
+    const startValue = row.effectiveFrom || row.createdAt;
+    const start = startValue ? new Date(startValue) : null;
+    if (start && Number.isFinite(start.getTime()) && start > when) return false;
+    const end = row.effectiveTo ? new Date(row.effectiveTo) : null;
+    if (end && Number.isFinite(end.getTime()) && end <= when) return false;
+    return true;
+  });
+  if (legacy) return legacy;
+
+  throw notFound(
+    `No ${normalizedType.toLowerCase()} price configured for oil type ${oilTypeId} on ${when.toISOString().slice(0, 10)}. Check OilPrice records: oilTypeId must match the OilType _id, priceType must be ${normalizedType}, isActive must be true, and effectiveFrom must be on or before the transaction date.`,
+  );
 }
 export async function priceHistory(query) {
   const filter = {};
