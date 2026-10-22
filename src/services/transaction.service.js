@@ -171,3 +171,25 @@ export async function reversePurchase(id, reason, actor) {
     return doc;
   });
 }
+
+export async function reverseSale(id, reason, actor) {
+  return withTransaction(async session => {
+    const doc = await Sale.findById(id).session(session);
+    if (!doc) throw notFound("Sale not found");
+    if (doc.status !== "CONFIRMED") throw conflict("Sale is already reversed");
+    if (doc.paidAmount > 0) throw conflict("Reverse/refund associated payments before reversing the sale");
+    for (const item of doc.items) {
+      await createMovement({
+        movementDate: new Date(), oilTypeId: item.oilTypeId, storageLocationId: item.storageLocationId,
+        movementType: "RETURN_IN", quantityInKg: item.quantityKg, quantityOutKg: 0,
+        unitCostPerKg: item.unitCostPerKg || 0, referenceType: "SALE_REVERSAL",
+        referenceId: doc._id, notes: reason || `Reversal of ${doc.saleNumber}`
+      }, actor, session);
+    }
+    const before = doc.toObject();
+    doc.status = "REVERSED";
+    await doc.save({ session });
+    await writeAudit({ userId: actor.id, action: "REVERSE_SALE", entityType: "Sale", entityId: id, before, after: doc.toObject(), reason, session });
+    return doc;
+  });
+}

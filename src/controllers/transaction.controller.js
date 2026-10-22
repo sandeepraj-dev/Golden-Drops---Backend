@@ -1,8 +1,8 @@
 import { Purchase, Sale, Payment, StockLedger, Expense, OilPrice, DailyStock, Customer, Supplier } from "../models/index.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
-import { createPurchase, createSale, createPayment, reversePurchase } from "../services/transaction.service.js";
+import { createPurchase, createSale, createPayment, reversePurchase, reverseSale } from "../services/transaction.service.js";
 import { createPrice, priceHistory, closePricePeriod } from "../services/price.service.js";
-import { getStock, recordOpeningStock } from "../services/stock.service.js";
+import { getStock, recordOpeningStock, createMovement } from "../services/stock.service.js";
 import { profitAndLoss, balancesSummary } from "../services/accounting.service.js";
 import { customerStatement, supplierStatement } from "../services/statement.service.js";
 import { generateDailyStock, setPhysicalCount, approveDailyStock } from "../services/daily-stock.service.js";
@@ -57,14 +57,31 @@ export const expenseCreate=asyncHandler(async(req,res)=>{
 export const expensesList=listModel(Expense,"expenseDate");
 export const pnl=asyncHandler(async(req,res)=>res.json({success:true,data:await profitAndLoss(req.query)}));
 export const dashboard=asyncHandler(async(req,res)=>{
- const [balances,stock,todaySales,todayPurchases,todayPayments,recentSales]=await Promise.all([
- balancesSummary(),getStock(),
- Sale.aggregate([{$match:{status:"CONFIRMED",saleDate:{$gte:new Date(new Date().setHours(0,0,0,0))}}},{$group:{_id:null,total:{$sum:"$grandTotal"},quantity:{$sum:"$totalQuantityKg"}}}]),
- Purchase.aggregate([{$match:{status:"CONFIRMED",purchaseDate:{$gte:new Date(new Date().setHours(0,0,0,0))}}},{$group:{_id:null,total:{$sum:"$grandTotal"},quantity:{$sum:"$totalQuantityKg"}}}]),
- Payment.aggregate([{$match:{status:"CONFIRMED",transactionDate:{$gte:new Date(new Date().setHours(0,0,0,0))}}},{$group:{_id:"$direction",total:{$sum:"$amount"}}}]),
- Sale.find({status:"CONFIRMED"}).sort({createdAt:-1}).limit(10).lean()
+ const now = new Date();
+ const start = req.query.from ? new Date(req.query.from) : new Date(now.getFullYear(), now.getMonth(), now.getDate());
+ const end = req.query.to ? new Date(req.query.to) : now;
+ if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) throw badRequest("Invalid dashboard date range");
+ const range = { $gte: start, $lte: end };
+ const [balances,stock,purchases,sales,payments,dispatches,recentPurchases,recentSales,recentPayments] = await Promise.all([
+  balancesSummary(), getStock(),
+  Purchase.aggregate([{$match:{status:"CONFIRMED",purchaseDate:range}},{$group:{_id:null,totalAmount:{$sum:"$grandTotal"},totalKg:{$sum:"$totalQuantityKg"},count:{$sum:1}}}]),
+  Sale.aggregate([{$match:{status:"CONFIRMED",saleDate:range}},{$group:{_id:null,totalAmount:{$sum:"$grandTotal"},totalKg:{$sum:"$totalQuantityKg"},count:{$sum:1}}}]),
+  Payment.aggregate([{$match:{status:"CONFIRMED",transactionDate:range}},{$group:{_id:"$direction",totalAmount:{$sum:"$amount"},count:{$sum:1}}}]),
+  StockLedger.aggregate([{$match:{referenceType:"WAREHOUSE_DISPATCH",movementDate:range}},{$group:{_id:null,totalDispatchedKg:{$sum:"$quantityOutKg"},count:{$sum:1}}}]),
+  Purchase.find({status:"CONFIRMED"}).sort({createdAt:-1}).limit(10).lean(),
+  Sale.find({status:"CONFIRMED"}).sort({createdAt:-1}).limit(10).lean(),
+  Payment.find({status:"CONFIRMED"}).sort({createdAt:-1}).limit(10).lean()
  ]);
- res.json({success:true,data:{date:new Date().toISOString().slice(0,10),todaySales:todaySales[0]||{total:0,quantity:0},todayPurchases:todayPurchases[0]||{total:0,quantity:0},todayPayments,stock,balances,recentSales}});
+ const pnl = await profitAndLoss({from:start.toISOString(),to:end.toISOString()});
+ res.json({success:true,data:{
+  period:{from:start,to:end},
+  purchases:purchases[0]||{totalAmount:0,totalKg:0,count:0},
+  sales:sales[0]||{totalAmount:0,totalKg:0,count:0},
+  payments:payments.reduce((acc,p)=>{acc[p._id==="RECEIVED"?"received":"paid"]={totalAmount:p.totalAmount,count:p.count};return acc;},{received:{totalAmount:0,count:0},paid:{totalAmount:0,count:0}}),
+  warehouseDispatch:dispatches[0]||{totalDispatchedKg:0,count:0},
+  stock, balances, profitAndLoss:pnl,
+  recent:{purchases:recentPurchases,recentSales,recentPayments}
+ }});
 });
 export const customerStatementController=asyncHandler(async(req,res)=>res.json({success:true,data:await customerStatement(req.params.id,req.query)}));
 export const supplierStatementController=asyncHandler(async(req,res)=>res.json({success:true,data:await supplierStatement(req.params.id,req.query)}));
@@ -103,3 +120,21 @@ export const dailyStockPdf=asyncHandler(async(req,res)=>{
  const rows=await DailyStock.find(f).populate("oilTypeId storageLocationId").sort({businessDate:1}).limit(500).lean();
  createPdfResponse(res,"daily-stock.pdf","Daily Stock Report",doc=>{for(const r of rows){drawKeyValues(doc,{Date:new Date(r.businessDate).toLocaleDateString("en-IN"),Oil:r.oilTypeId?.oilName,Location:r.storageLocationId?.locationName,"Opening kg":r.openingStockKg,"Purchases kg":r.purchaseInKg,"Sales kg":r.salesOutKg,"Expected closing kg":r.expectedClosingStockKg,"Physical closing kg":r.physicalClosingStockKg??"Not counted","Variance kg":r.varianceKg??"N/A"});doc.moveDown(0.5);}});
 });
+
+// Explicit warehouse dispatch endpoint: dispatch decreases available warehouse stock.
+export const dispatchStock = asyncHandler(async (req, res) => {
+ const { oilTypeId, storageLocationId, quantityKg, movementDate, notes, dispatchTo, referenceNumber } = req.body;
+ const quantity = Number(quantityKg);
+ if (!Number.isFinite(quantity) || quantity <= 0) throw badRequest("quantityKg must be greater than zero");
+ const movement = await createMovement({
+   oilTypeId, storageLocationId, quantityInKg: 0, quantityOutKg: quantity,
+   movementDate: movementDate ? new Date(movementDate) : new Date(),
+   movementType: "ADJUSTMENT_OUT", referenceType: "WAREHOUSE_DISPATCH",
+   notes: [dispatchTo ? `Dispatch to: ${dispatchTo}` : "", referenceNumber ? `Reference: ${referenceNumber}` : "", notes || ""].filter(Boolean).join(" | ")
+ }, req.user);
+ res.status(201).json({ success: true, message: "Warehouse dispatch recorded", data: movement });
+});
+
+export const saleReverse = asyncHandler(async (req, res) =>
+ res.json({ success: true, message: "Sale reversed and stock restored", data: await reverseSale(req.params.id, req.body.reason, req.user) })
+);
